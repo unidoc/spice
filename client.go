@@ -49,6 +49,13 @@ type Client struct {
 	displays uint32      // Number of displays available
 	Debug    *log.Logger // Optional logger for debug information
 
+	// OnChannelClosed, if set, is invoked from a channel's ReadLoop
+	// when it terminates. Lets the embedding app react to a lost
+	// channel (repaint "Disconnected", offer reconnect, clean up
+	// downstream state) instead of silently orphaning goroutines.
+	// Fires exactly once per channel per Read failure.
+	OnChannelClosed func(typ Channel, id uint8, err error)
+
 	// Channel handlers for different SPICE channels
 	main     *ChMain      // Main channel for connection management
 	playback *ChPlayback  // Audio playback channel
@@ -59,6 +66,16 @@ type Client struct {
 	mmTime  uint32       // Media time in milliseconds from server
 	mmStamp time.Time    // Local timestamp when mmTime was received
 	mmLock  sync.RWMutex // Lock for media time access
+}
+
+// onChannelClosed is the internal accessor used by ReadLoop. Split
+// from the exported field so future gating (dedup, panic recovery)
+// lives here.
+func (c *Client) onChannelClosed(typ Channel, id uint8, err error) {
+	if c == nil || c.OnChannelClosed == nil {
+		return
+	}
+	c.OnChannelClosed(typ, id, err)
 }
 
 // New creates a new SPICE client and establishes connection to all available channels
@@ -107,19 +124,37 @@ func New(c Connector, driver Driver, password string) (*Client, error) {
 			wg.Add(1)
 			go func(id uint8) {
 				defer wg.Done()
-				cl.playback, _ = cl.setupPlayback(id)
+				pb, err := cl.setupPlayback(id)
+				if err != nil {
+					// Playback is optional; log and leave nil so
+					// downstream callers see the absence, but do
+					// not tear down the session over it.
+					log.Printf("spice: playback channel %d setup failed: %s", id, err)
+					return
+				}
+				cl.playback = pb
 			}(ch.id)
 		case ChannelRecord:
 			wg.Add(1)
 			go func(id uint8) {
 				defer wg.Done()
-				cl.record, _ = cl.setupRecord(id)
+				rc, err := cl.setupRecord(id)
+				if err != nil {
+					log.Printf("spice: record channel %d setup failed: %s", id, err)
+					return
+				}
+				cl.record = rc
 			}(ch.id)
 		case ChannelWebdav:
 			wg.Add(1)
 			go func(id uint8) {
 				defer wg.Done()
-				cl.webdav, _ = cl.setupWebdav(id)
+				wd, err := cl.setupWebdav(id)
+				if err != nil {
+					log.Printf("spice: webdav channel %d setup failed: %s", id, err)
+					return
+				}
+				cl.webdav = wd
 			}(ch.id)
 		case ChannelUsbRedir:
 			log.Printf("spice: USB supported, device #%d", ch.id)
@@ -176,15 +211,30 @@ func (client *Client) UpdateView(w, h int) {
 	}
 }
 
+// playbackAvailable is true iff the playback channel finished handshaking
+// during Client setup. All mute controls check this first so a session
+// without audio doesn't nil-deref on ToggleMute (previously crashed the
+// process when the SPICE server didn't advertise a playback channel).
+func (client *Client) playbackAvailable() bool { return client != nil && client.playback != nil }
+
 func (client *Client) ToggleMute() {
+	if !client.playbackAvailable() {
+		return
+	}
 	client.playback.mute = !client.playback.mute
 }
 
 func (client *Client) SetMute(muted bool) {
+	if !client.playbackAvailable() {
+		return
+	}
 	client.playback.mute = muted
 }
 
 func (client *Client) GetMute() bool {
+	if !client.playbackAvailable() {
+		return true // no playback → effectively muted
+	}
 	return client.playback.mute
 }
 

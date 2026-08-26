@@ -71,6 +71,9 @@ func (input *ChInputs) handle(typ uint16, data []byte) {
 }
 
 func (input *ChInputs) OnKeyDown(k []byte) {
+	if len(k) == 0 {
+		return
+	}
 	scancode := make([]byte, 4)
 	copy(scancode, k)
 
@@ -78,15 +81,24 @@ func (input *ChInputs) OnKeyDown(k []byte) {
 }
 
 func (input *ChInputs) OnKeyUp(k []byte) {
+	// An empty scancode used to panic on `scancode[ln-1]` (ln=0). At
+	// least one Fyne key event (Fn-lock on some laptops) delivers a
+	// zero-byte scancode. Drop rather than crash. Also cap to 4 —
+	// scancodes are per-message max 4 bytes; anything longer would be
+	// silently truncated by the copy which is misleading.
+	ln := len(k)
+	if ln == 0 {
+		return
+	}
+	if ln > 4 {
+		ln = 4
+	}
 	scancode := make([]byte, 4)
-	copy(scancode, k)
+	copy(scancode, k[:ln])
 
 	// AT scancode: insert 0xF0 before last byte
 	// XT scancode: set top bit of last part
-	ln := len(k)
 	scancode[ln-1] |= 0x80
-
-	//log.Printf("spice: sending key up %s as %+v", ev.Name, scancode)
 
 	input.conn.WriteMessage(SPICE_MSGC_INPUTS_KEY_UP, scancode)
 }

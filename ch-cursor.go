@@ -3,6 +3,7 @@ package spice
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"image"
 	"log"
 )
@@ -126,7 +127,21 @@ func (d *ChCursor) handle(typ uint16, data []byte) {
 	}
 }
 
+// maxCursorDim caps the width/height of a single cursor image.
+// The SPICE protocol allows up to uint16 max on both axes (65535×65535),
+// which would need ~17GB of RAM for a 4-byte ALPHA cursor — a trivial
+// DoS. Real SPICE cursors are 64×64 or 128×128; 256 gives ample headroom.
+const maxCursorDim = 256
+
 func (d *ChCursor) decodeCursor(data []byte) (*cursorInfo, error) {
+	// The header is a fixed 19 bytes. Reject short packets before we
+	// index into them — the previous version panicked on any packet
+	// shorter than that.
+	const cursorHeaderLen = 19
+	if len(data) < cursorHeaderLen {
+		return nil, fmt.Errorf("spice/cursor: header truncated (got %d, need %d)", len(data), cursorHeaderLen)
+	}
+
 	flags := binary.LittleEndian.Uint16(data[:2])
 	if flags&1 == 1 {
 		// no cursor header ... ?
@@ -142,25 +157,30 @@ func (d *ChCursor) decodeCursor(data []byte) (*cursorInfo, error) {
 	info.hotX = binary.LittleEndian.Uint16(data[15:17])
 	info.hotY = binary.LittleEndian.Uint16(data[17:19])
 
-	data = data[19:]
+	// Guard against server-supplied dimensions that would OOM the
+	// client (uint16 max squared × 4 bytes = ~17 GB allocation).
+	if info.width > maxCursorDim || info.height > maxCursorDim {
+		return nil, fmt.Errorf("spice/cursor: dimensions %dx%d exceed cap %d", info.width, info.height, maxCursorDim)
+	}
 
-	//l.Printf("spice/cursor: flags=%d unique=%d type=%d size=%d,%d hot=%d,%d rem=%d", flags, unique, typ, width, height, hotX, hotY, len(data))
+	data = data[cursorHeaderLen:]
 
 	switch info.typ {
 	case 0: // ALPHA
-		// len = 16408-5-17 = 16386. 64*64*4 = 16384
 		ln := int(info.width) * int(info.height) * 4
 		if len(data) < ln {
 			return nil, errors.New("unable to decode cursor: not enough data")
 		}
 
-		// reverse red & blue
-		for i := 0; i < len(data); i += 4 {
+		// reverse red & blue in the payload we're about to consume.
+		// Bound the loop by ln instead of len(data) — the incoming
+		// buffer may include trailing bytes we don't own.
+		for i := 0; i < ln; i += 4 {
 			data[i], data[i+2] = data[i+2], data[i]
 		}
 
 		im := image.NewRGBA(image.Rectangle{Max: image.Point{int(info.width), int(info.height)}})
-		copy(im.Pix, data)
+		copy(im.Pix, data[:ln])
 
 		info.im = im
 

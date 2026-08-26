@@ -50,7 +50,13 @@ type SpiceConn struct {
 
 // ReadLoop continuously reads and processes incoming messages from the SPICE server
 // It handles message acknowledgment according to the server's requirements
-// and dispatches messages to the appropriate handlers
+// and dispatches messages to the appropriate handlers.
+//
+// A hostile server can send an unbounded number of near-10MB messages
+// (the per-frame cap in ReadData); we don't cap the session's aggregate
+// but the readloop is single-threaded so the pace is bounded by the
+// downstream `process` handler. Callers who need a hard rate cap should
+// wrap the underlying net.Conn with a bandwidth limiter.
 func (c *SpiceConn) ReadLoop() {
 	// Read packets until an error occurs (typically connection closed)
 	for {
@@ -76,10 +82,27 @@ func (c *SpiceConn) ReadLoop() {
 			return c.process(typ, data)
 		})
 		if err != nil {
-			log.Printf("spice: read failed: %s", err)
+			log.Printf("spice: %s read failed: %s", c.String(), err)
+			// Notify caller that the channel died so it can clean up
+			// downstream state instead of silently orphaning goroutines.
+			if c.client != nil {
+				c.client.onChannelClosed(c.typ, c.id, err)
+			}
 			return
 		}
 	}
+}
+
+// debugLog routes through client.Debug when set, mirroring how
+// ch-cursor.go and a few other files already log. Everywhere else in
+// the package uses the top-level `log` unconditionally, defeating the
+// point of the Debug logger. New code and progressively-refactored
+// call sites should prefer this helper.
+func (c *SpiceConn) debugLog(format string, args ...interface{}) {
+	if c == nil || c.client == nil || c.client.Debug == nil {
+		return
+	}
+	c.client.Debug.Printf("spice: "+format, args...)
 }
 
 func (c *SpiceConn) String() string {
@@ -226,20 +249,42 @@ func (c *SpiceConn) ReadData(cb func(typ uint16, data []byte) error) error {
 		return cb(typ, buf)
 	}
 
-	// ok we have to deal with sublist and all that crap. But first, let's set the msg
+	// Sub-list path. Every offset below is server-supplied — a hostile
+	// SPICE server can otherwise trivially panic the client with a
+	// crafted subList/subCnt/offt/size. Guard every slice against the
+	// declared size.
+	bufLen := uint32(len(buf))
+	if subList > bufLen || subList+2 > bufLen {
+		return fmt.Errorf("spice: sublist offset %d out of bounds (buf=%d)", subList, bufLen)
+	}
 	mainBuf := buf[:subList]
 
 	subCnt := binary.LittleEndian.Uint16(buf[subList : subList+2])
-
-	// TODO check all values against going out of bound of the slice
+	// Header uses 4 bytes per sub-entry offset. Reject before we even
+	// touch the loop so we don't do partial delivery on a bad frame.
+	if uint32(subCnt)*4+subList+2 > bufLen {
+		return fmt.Errorf("spice: subCnt %d does not fit in buffer of %d", subCnt, bufLen)
+	}
 	for i := uint16(0); i < subCnt; i++ {
-		offt := subList + 2 + (uint32(i) * 4)
-		offt = binary.LittleEndian.Uint32(buf[offt : offt+4])
+		offtPos := subList + 2 + (uint32(i) * 4)
+		if offtPos+4 > bufLen {
+			return fmt.Errorf("spice: sub-entry %d header offset out of bounds", i)
+		}
+		offt := binary.LittleEndian.Uint32(buf[offtPos : offtPos+4])
+		// A sub-entry needs 2 bytes for type + 4 bytes for size before
+		// any payload; verify that much is inside the buffer.
+		if offt+6 > bufLen || offt+6 < offt {
+			return fmt.Errorf("spice: sub-entry %d header extends past buffer", i)
+		}
 
 		size := binary.LittleEndian.Uint32(buf[offt+2 : offt+6])
+		end := offt + 6 + size
+		if end < offt+6 || end > bufLen {
+			return fmt.Errorf("spice: sub-entry %d payload (size %d at %d) out of bounds", i, size, offt+6)
+		}
 
 		subTyp := binary.LittleEndian.Uint16(buf[offt : offt+2])
-		subDat := buf[offt+6 : offt+6+size]
+		subDat := buf[offt+6 : end]
 
 		if err := cb(subTyp, subDat); err != nil {
 			return err
@@ -330,7 +375,13 @@ func (c *SpiceConn) handshake(typ Channel, chId uint8, channelCaps []uint32) err
 		return err
 	}
 
-	c.Write(ciphertext)
+	// Propagate write errors instead of blindly waiting for a reply.
+	// Historically a short write here (e.g. TLS mid-handshake, closed
+	// socket) would silently proceed into ReadError, where the peer
+	// hang mimicked a server-side auth reject.
+	if _, err := c.Write(ciphertext); err != nil {
+		return fmt.Errorf("spice: write auth ciphertext: %w", err)
+	}
 	return c.ReadError()
 }
 

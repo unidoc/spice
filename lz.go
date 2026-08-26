@@ -33,13 +33,29 @@ func lzImage(buf []byte, palette []color.RGBA, img *image.RGBA) (image.Image, er
 	height := binary.BigEndian.Uint32(buf[16:20])
 	stride := binary.BigEndian.Uint32(buf[20:24])
 	top_down := binary.BigEndian.Uint32(buf[24:28])
-
-	//log.Printf("spice/lz: decoding image version=%d type=%s %dx%d stride=%d top_down=%d", vers, typ, width, height, stride, top_down)
 	_ = vers // avoid unused error when log is commented
+
+	// Guard against a hostile server that picks stride/height/width
+	// values whose product overflows int or requires a multi-GB
+	// allocation. A single SPICE display can't practically exceed
+	// 16K×16K@RGBA (~1 GB), which itself is absurd — cap generously
+	// but decisively. `stride < width*bytesPerPixel` is also
+	// nonsense, but we tolerate it since some encoders round up.
+	const (
+		maxLzImageDim   = 16384          // 16K per axis
+		maxLzImageBytes = int64(1) << 32 // 4 GiB total ceiling
+	)
+	if width > maxLzImageDim || height > maxLzImageDim || stride > maxLzImageDim*4 {
+		return nil, fmt.Errorf("lz: refusing %dx%d image (stride %d) — exceeds sanity caps", width, height, stride)
+	}
+	total := int64(stride) * int64(height)
+	if total <= 0 || total > maxLzImageBytes {
+		return nil, fmt.Errorf("lz: refusing image of %d bytes — exceeds sanity cap", total)
+	}
 
 	// build image directly so we guarantee the right stride
 	if img == nil {
-		img = &image.RGBA{Pix: make([]byte, stride*height), Stride: int(stride), Rect: image.Rectangle{Min: image.Point{0, 0}, Max: image.Point{int(width), int(height)}}}
+		img = &image.RGBA{Pix: make([]byte, total), Stride: int(stride), Rect: image.Rectangle{Min: image.Point{0, 0}, Max: image.Point{int(width), int(height)}}}
 	}
 
 	lzBuf := bytes.NewReader(buf[28:])

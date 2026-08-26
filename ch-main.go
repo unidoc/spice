@@ -164,14 +164,35 @@ type ChMain struct {
 	channels []SpiceChannelInfo
 
 	// for vdagent
-	vdq [][]byte // vd queue
-	vdl sync.Mutex
-	vdc *sync.Cond
-	vdb []byte // read buffer
+	vdq       [][]byte // vd queue
+	vdl       sync.Mutex
+	vdc       *sync.Cond
+	vdb       []byte // read buffer
+	vdStopped bool   // set by Close() to signal vdQueue to exit
 
 	// clipboard (remote→local)
 	clipboardCh chan *ClipboardData
 	clipboardLk sync.Mutex
+}
+
+// Close signals the background vdQueue goroutine to exit and releases
+// any pending waiters. Historically vdQueue was an infinite loop with
+// no exit path — every reconnect leaked one goroutine per channel.
+func (m *ChMain) Close() {
+	m.vdl.Lock()
+	m.vdStopped = true
+	if m.vdc != nil {
+		m.vdc.Broadcast()
+	}
+	m.vdl.Unlock()
+	// Also wake any clipboard requester that's still parked on the
+	// per-request channel so RequestClipboard doesn't leak on shutdown.
+	m.clipboardLk.Lock()
+	if m.clipboardCh != nil {
+		close(m.clipboardCh)
+		m.clipboardCh = nil
+	}
+	m.clipboardLk.Unlock()
 }
 
 func (cl *Client) setupMain() error {
@@ -304,7 +325,16 @@ func (m *ChMain) handle(typ uint16, data []byte) {
 
 func (m *ChMain) updateAgentToken(amount uint32) {
 	atomic.AddUint32(&m.agentTokens, amount)
-	m.vdc.Signal()
+	// vdc is nil until vdQueue() has run its first line. A token
+	// message arriving before that panicked the process. Guard the
+	// signal; the queue will observe the added tokens as soon as it
+	// enters its Wait loop.
+	m.vdl.Lock()
+	c := m.vdc
+	m.vdl.Unlock()
+	if c != nil {
+		c.Signal()
+	}
 }
 
 func (m *ChMain) MouseModeRequest(mod uint32) error {
@@ -435,11 +465,24 @@ func (m *ChMain) SendGrabClipboard(selection SpiceClipboardSelection, formatType
 func (m *ChMain) RequestClipboard(selection SpiceClipboardSelection, clipboardType SpiceClipboardFormat) ([]byte, error) {
 	log.Printf("spice/main: send request clipboard command with type %d", clipboardType)
 
+	// clipboardLk guards the *pointer* handoff between requester and
+	// the agent-handler goroutine. Hold it long enough to publish the
+	// channel then release — waiting on the channel itself while
+	// holding the lock would block every incoming agent message.
 	m.clipboardLk.Lock()
-	defer m.clipboardLk.Unlock()
-
-	ch := make(chan *ClipboardData, 2)
+	ch := make(chan *ClipboardData, 1)
 	m.clipboardCh = ch
+	m.clipboardLk.Unlock()
+
+	// Ensure late-arriving deliveries (post-timeout) don't accumulate
+	// on a stale channel pointer.
+	defer func() {
+		m.clipboardLk.Lock()
+		if m.clipboardCh == ch {
+			m.clipboardCh = nil
+		}
+		m.clipboardLk.Unlock()
+	}()
 
 	var err error
 	if testCap(m.agentCaps, VD_AGENT_CAP_CLIPBOARD_SELECTION) {
@@ -454,10 +497,10 @@ func (m *ChMain) RequestClipboard(selection SpiceClipboardSelection, clipboardTy
 
 	// 5secs timeout on read
 	t := time.NewTimer(5 * time.Second)
+	defer t.Stop()
 
 	select {
 	case res := <-ch:
-		//log.Printf("spice/main: got clipboard data, len=%d", len(res.data))
 		return res.data, nil
 	case <-t.C:
 		return nil, errors.New("timeout while reading")
@@ -465,17 +508,28 @@ func (m *ChMain) RequestClipboard(selection SpiceClipboardSelection, clipboardTy
 }
 
 func (m *ChMain) handleIncomingClipboard(selection SpiceClipboardSelection, typ SpiceClipboardFormat, data []byte) {
-	//log.Printf("received clipboard %d/%d len=%d", selection, typ, len(data))
 	obj := &ClipboardData{
 		selection:  selection,
 		formatType: typ,
 		data:       data,
 	}
 
+	// Read the current requester channel under the same lock the
+	// setter uses. Previously we read m.clipboardCh unlocked, which
+	// races on the pointer word (data race under `go run -race`) and
+	// could deliver to a channel a subsequent request already replaced.
+	m.clipboardLk.Lock()
+	ch := m.clipboardCh
+	m.clipboardLk.Unlock()
+
+	if ch == nil {
+		return
+	}
 	select {
-	case m.clipboardCh <- obj:
+	case ch <- obj:
 	default:
-		// do not lock
+		// buffer full — the requester either timed out or hasn't
+		// drained yet; drop rather than block the agent-handler.
 	}
 }
 
@@ -509,11 +563,16 @@ func (m *ChMain) agentHandler(data []byte) {
 		m.vdb = nil
 	}
 
-	m.serverTokens--
-	if m.serverTokens == 0 {
+	// Access via atomic ops to match agentTokens' model and silence
+	// `go test -race`. `agentHandler` is only ever called from the
+	// readLoop goroutine today, but that invariant isn't enforced
+	// anywhere in the type — a future channel refactor could break it.
+	// AddUint32(^uint32(0)) is the canonical Go idiom for atomic
+	// decrement; equivalent to `-1` under two's complement.
+	if atomic.AddUint32(&m.serverTokens, ^uint32(0)) == 0 {
 		log.Println("spice/main: server token pool is empty, send more tokens.")
 		m.conn.WriteMessage(SPICE_MSGC_MAIN_AGENT_TOKEN, uint32(VD_AGENT_SERVER_TOKEN_AMOUNT))
-		m.serverTokens += 10
+		atomic.AddUint32(&m.serverTokens, 10)
 	}
 
 	proto := binary.LittleEndian.Uint32(data[:4])
@@ -530,11 +589,38 @@ func (m *ChMain) agentHandler(data []byte) {
 		return
 	}
 
+	// Now that we have a full frame, strip the 20-byte agent header
+	// and constrain the working slice to the declared size. Every
+	// case below indexes into `data` directly — historically a
+	// hostile agent could send a 20-byte packet with size=0 and
+	// panic every clipboard handler on `data[0]`.
 	data = data[20:]
-	data = data[:size] // just in case
+	if int(size) > len(data) {
+		size = uint32(len(data))
+	}
+	data = data[:size]
+
+	// clipboardHeader returns (selection, payload, ok). ok=false means
+	// the payload is too short for the selection prefix and the caller
+	// should drop the message.
+	clipboardHeader := func(d []byte) (SpiceClipboardSelection, []byte, bool) {
+		sel := VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD
+		if testCap(m.agentCaps, VD_AGENT_CAP_CLIPBOARD_SELECTION) {
+			if len(d) < 4 {
+				return 0, nil, false
+			}
+			sel = SpiceClipboardSelection(d[0])
+			d = d[4:]
+		}
+		return sel, d, true
+	}
 
 	switch typ {
 	case VD_AGENT_ANNOUNCE_CAPABILITIES:
+		if len(data) < 4 {
+			log.Printf("spice/main: dropping short capability announce")
+			return
+		}
 		data = data[4:] // skip uint32_t  request - should be zero
 		// read capabilities!
 		cnt := len(data) / 4
@@ -545,23 +631,21 @@ func (m *ChMain) agentHandler(data []byte) {
 		if len(c) > 0 {
 			m.agentCaps = c[0]
 		}
-		//log.Printf("DATA = %s", hex.Dump(data))
 		log.Printf("spice/main: received capabilities from agent: %v", c)
 	case VD_AGENT_CLIPBOARD:
-		// got clipboard
-		selection := VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD
-		if testCap(m.agentCaps, VD_AGENT_CAP_CLIPBOARD_SELECTION) {
-			selection = SpiceClipboardSelection(data[0])
-			data = data[4:] // uint8_t __reserved[sizeof(uint32_t) - 1 * sizeof(uint8_t)];
+		selection, data, ok := clipboardHeader(data)
+		if !ok || len(data) < 4 {
+			log.Printf("spice/main: dropping short CLIPBOARD frame")
+			return
 		}
 		typ := SpiceClipboardFormat(binary.LittleEndian.Uint32(data[:4]))
 		data = data[4:]
 		m.handleIncomingClipboard(selection, typ, data)
 	case VD_AGENT_CLIPBOARD_GRAB: // remote is claiming ownership on the clipboard
-		selection := VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD
-		if testCap(m.agentCaps, VD_AGENT_CAP_CLIPBOARD_SELECTION) {
-			selection = SpiceClipboardSelection(data[0])
-			data = data[4:] // uint8_t __reserved[sizeof(uint32_t) - 1 * sizeof(uint8_t)];
+		selection, data, ok := clipboardHeader(data)
+		if !ok {
+			log.Printf("spice/main: dropping short CLIPBOARD_GRAB frame")
+			return
 		}
 		cnt := len(data) / 4
 		c := make([]SpiceClipboardFormat, cnt)
@@ -571,11 +655,10 @@ func (m *ChMain) agentHandler(data []byte) {
 		// TODO this should call the handler and inform of the available types, choosing a type should be up to the handler
 		m.cl.driver.ClipboardGrabbed(selection, c)
 	case VD_AGENT_CLIPBOARD_REQUEST:
-		// send our clipboard
-		selection := VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD
-		if testCap(m.agentCaps, VD_AGENT_CAP_CLIPBOARD_SELECTION) {
-			selection = SpiceClipboardSelection(data[0])
-			data = data[4:]
+		selection, data, ok := clipboardHeader(data)
+		if !ok || len(data) < 4 {
+			log.Printf("spice/main: dropping short CLIPBOARD_REQUEST frame")
+			return
 		}
 		typ := SpiceClipboardFormat(binary.LittleEndian.Uint32(data[:4]))
 		log.Printf("spice/main: fetching clipboard %d/%d", selection, typ)
@@ -590,6 +673,10 @@ func (m *ChMain) agentHandler(data []byte) {
 		// release when clipboard is empty
 		selection := VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD
 		if testCap(m.agentCaps, VD_AGENT_CAP_CLIPBOARD_SELECTION) {
+			if len(data) < 1 {
+				log.Printf("spice/main: dropping short CLIPBOARD_RELEASE frame")
+				return
+			}
 			selection = SpiceClipboardSelection(data[0])
 		}
 		m.cl.driver.ClipboardRelease(selection)
@@ -599,10 +686,16 @@ func (m *ChMain) agentHandler(data []byte) {
 }
 
 func (m *ChMain) vdQueue() {
-	m.vdc = sync.NewCond(&m.vdl)
 	m.vdl.Lock()
+	// Publish vdc under the same lock the setter+signaller take so
+	// updateAgentToken doesn't Signal a nil Cond during startup race.
+	m.vdc = sync.NewCond(&m.vdl)
 
 	for {
+		if m.vdStopped {
+			m.vdl.Unlock()
+			return
+		}
 		if len(m.vdq) == 0 {
 			m.vdc.Wait()
 			continue
@@ -625,10 +718,13 @@ func (m *ChMain) vdQueue() {
 			m.vdq[0] = m.vdq[0][VD_AGENT_MAX_DATA_SIZE:]
 		}
 
-		// write buf
+		// write buf — drop the queue lock across the network write so
+		// AgentWrite callers aren't blocked waiting on our socket.
+		m.vdl.Unlock()
 		m.conn.WriteMessage(
 			SPICE_MSGC_MAIN_AGENT_DATA,
 			buf,
 		)
+		m.vdl.Lock()
 	}
 }

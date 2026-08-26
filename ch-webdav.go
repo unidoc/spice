@@ -215,11 +215,33 @@ func (d *SpiceWebdav) sendNextChunk(transfer *ActiveTransfer) {
 	}
 }
 
+// sanitizeXferFileName strips newlines and carriage returns from a
+// file name before it goes into the vdagent keyfile-shaped payload.
+// Without this, a filename like "harmless\nname=evil\nsize=99" would
+// inject arbitrary keys the guest agent parses — the receiver ends up
+// writing to a path or with a size chosen by the sender. Also caps
+// length so a hostile side can't force the agent to buffer megabytes.
+func sanitizeXferFileName(name string) string {
+	// Drop the classic control chars that end an INI line.
+	repl := strings.NewReplacer(
+		"\n", "_",
+		"\r", "_",
+		"\x00", "_",
+	)
+	out := repl.Replace(name)
+	const maxNameLen = 255 // matches POSIX NAME_MAX and Windows MAX_PATH segment
+	if len(out) > maxNameLen {
+		out = out[:maxNameLen]
+	}
+	return out
+}
+
 // sendFileXferStart sends a file transfer start message
 func (d *SpiceWebdav) sendFileXferStart(id uint32, fileName string, fileSize int64) error {
 	// Build the file info data in the format expected by the agent
 	// The format is a simple key-value format similar to INI files
-	keyFile := fmt.Sprintf("[vdagent-file-xfer]\nname=%s\nsize=%d\n", fileName, fileSize)
+	safeName := sanitizeXferFileName(fileName)
+	keyFile := fmt.Sprintf("[vdagent-file-xfer]\nname=%s\nsize=%d\n", safeName, fileSize)
 
 	// Create the message
 	msgBuf := &bytes.Buffer{}

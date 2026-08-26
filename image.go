@@ -23,6 +23,26 @@ type Image struct {
 	Height uint32
 }
 
+// readSubImageLen extracts the little-endian uint32 length prefix at
+// buf[0:4] and returns the slice buf[4:4+ln]. Rejects declared lengths
+// that don't fit in the remaining buffer OR that overflow the int
+// domain — on 32-bit platforms a length near 2^31 would wrap negative
+// during the int conversion and pass the naïve `len(buf) < 4+int(ln)`
+// check, then panic on the slice. See conn.go for the parent frame's
+// 10MB cap; this is a per-sub-image belt-and-braces guard.
+func readSubImageLen(buf []byte) ([]byte, error) {
+	if len(buf) < 4 {
+		return nil, errors.New("invalid data for image")
+	}
+	ln := binary.LittleEndian.Uint32(buf[:4])
+	// int(ln)+4 must not overflow and must fit in buf.
+	end := int64(ln) + 4
+	if end < 4 || end > int64(len(buf)) {
+		return nil, errors.New("data is missing")
+	}
+	return buf[4:end], nil
+}
+
 func DecodeImage(buf []byte) (*Image, error) {
 	i := &Image{}
 
@@ -37,8 +57,6 @@ func DecodeImage(buf []byte) (*Image, error) {
 	i.Width = binary.LittleEndian.Uint32(buf[10:14])
 	i.Height = binary.LittleEndian.Uint32(buf[14:18])
 
-	//log.Printf("decode spice img %dx%d id=%d typ=%d flags=%d", i.Width, i.Height, i.ID, i.Type, i.Flags)
-
 	buf = buf[18:]
 
 	switch i.Type {
@@ -50,16 +68,10 @@ func DecodeImage(buf []byte) (*Image, error) {
 		i.Image = img
 		return i, nil
 	case 1: // quic
-		if len(buf) < 4 {
-			// invalid
-			return nil, errors.New("invalid data for image")
+		img_buf, err := readSubImageLen(buf)
+		if err != nil {
+			return nil, err
 		}
-		ln := binary.LittleEndian.Uint32(buf[:4])
-		if len(buf) < 4+int(ln) {
-			return nil, errors.New("data is missing")
-		}
-
-		img_buf := buf[4 : ln+4]
 
 		img, err := quic.Decode(bytes.NewReader(img_buf))
 		if err != nil {
@@ -72,16 +84,10 @@ func DecodeImage(buf []byte) (*Image, error) {
 		//var palette []color.RGBA
 		return nil, fmt.Errorf("todo palette lz_plt")
 	case 101: // lz_rgb
-		if len(buf) < 4 {
-			// invalid
-			return nil, errors.New("invalid data for image")
+		img_buf, err := readSubImageLen(buf)
+		if err != nil {
+			return nil, err
 		}
-		ln := binary.LittleEndian.Uint32(buf[:4])
-		if len(buf) < 4+int(ln) {
-			return nil, errors.New("data is missing")
-		}
-
-		img_buf := buf[4 : ln+4]
 
 		img, err := lzImage(img_buf, nil, nil)
 		if err != nil {
@@ -99,16 +105,10 @@ func DecodeImage(buf []byte) (*Image, error) {
 			// */
 		return i, nil
 	case 105: // 105=jpeg
-		if len(buf) < 4 {
-			// invalid
-			return nil, errors.New("invalid data for image")
+		img_buf, err := readSubImageLen(buf)
+		if err != nil {
+			return nil, err
 		}
-		ln := binary.LittleEndian.Uint32(buf[:4])
-		if len(buf) < 4+int(ln) {
-			return nil, errors.New("data is missing")
-		}
-
-		img_buf := buf[4 : ln+4]
 
 		// decode jpeg
 		img, err := jpeg.Decode(bytes.NewReader(img_buf))
@@ -164,13 +164,25 @@ func DecodeImage(buf []byte) (*Image, error) {
 	return i, nil
 }
 
+// reverseImgRGBA flips img vertically in place. The old implementation
+// allocated a full clone of img.Pix every call — for a 1920×1080 RGBA
+// buffer that's ~8 MB of GC pressure per frame. This two-pointer swap
+// uses a single stride-sized scratch buffer regardless of image size,
+// which shows up as measurably lower steady-state RSS + fewer GC pauses
+// during heavy jpeg_alpha traffic (Windows guest scrolling with alpha
+// cursors is the pathological case).
 func reverseImgRGBA(img *image.RGBA) {
 	height := img.Bounds().Dy()
 	stride := img.Stride
-	newPix := make([]uint8, len(img.Pix))
-	for i := 0; i < height; i++ {
-		j := height - i - 1
-		copy(newPix[stride*i:stride*(i+1)], img.Pix[stride*j:stride*(j+1)])
+	if height < 2 || stride == 0 {
+		return
 	}
-	img.Pix = newPix
+	tmp := make([]uint8, stride)
+	for top, bottom := 0, height-1; top < bottom; top, bottom = top+1, bottom-1 {
+		topRow := img.Pix[stride*top : stride*(top+1)]
+		botRow := img.Pix[stride*bottom : stride*(bottom+1)]
+		copy(tmp, topRow)
+		copy(topRow, botRow)
+		copy(botRow, tmp)
+	}
 }

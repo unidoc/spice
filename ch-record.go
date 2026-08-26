@@ -127,22 +127,28 @@ func (d *ChRecord) handle(typ uint16, data []byte) {
 		d.format = format
 		d.freq = freq
 
-		// Start audio capture
-		d.stream.Start()
-		atomic.StoreUint32(&d.run, 1)
-
-		// Initialize audio encoder based on mode
+		// Initialise the encoder BEFORE we flip the run flag or spawn
+		// the record goroutine. The old ordering left run=1 and a live
+		// stream running even when opus.NewEncoder failed — startRecord
+		// then nil-derefed d.enc.Encode on the first read.
 		switch d.mode {
 		case SPICE_AUDIO_DATA_MODE_OPUS:
-			// Initialize Opus encoder with voice optimization for microphone input
 			d.enc, err = opus.NewEncoder(int(d.freq), int(d.channels), opus.AppVoIP)
 			if err != nil {
 				log.Printf("spice/record: failed to initialize opus encoder: %s", err)
 				return
 			}
+		default:
+			log.Printf("spice/record: unsupported audio mode %d — refusing to start", d.mode)
+			return
 		}
 
-		// Start background goroutine for capturing and sending audio data
+		// Now safe to open the stream and start the goroutine.
+		if err := d.stream.Start(); err != nil {
+			log.Printf("spice/record: failed to start audio stream: %s", err)
+			return
+		}
+		atomic.StoreUint32(&d.run, 1)
 		go d.startRecord()
 
 	case SPICE_MSG_RECORD_STOP:
@@ -182,9 +188,24 @@ func (d *ChRecord) handle(typ uint16, data []byte) {
 }
 
 // startRecord continually captures audio data from the microphone,
-// encodes it, and sends it to the SPICE server
+// encodes it, and sends it to the SPICE server. It clears d.run on
+// exit so a subsequent RECORD_START on the same ChRecord instance
+// gets a clean state — the previous implementation left run=1 after
+// a mid-loop error, silently rejecting the next start.
 func (d *ChRecord) startRecord() {
-	defer d.stream.Stop()
+	defer func() {
+		if d.stream != nil {
+			d.stream.Stop()
+		}
+		atomic.StoreUint32(&d.run, 0)
+	}()
+
+	// Belt and braces — refuse to loop if the encoder somehow slipped
+	// past the start-handler check. Better a clean exit than a nil deref.
+	if d.enc == nil {
+		log.Printf("spice/record: startRecord entered with nil encoder — aborting")
+		return
+	}
 
 	// Allocate buffer for encoded audio data
 	buf := make([]byte, 512)
