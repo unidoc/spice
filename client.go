@@ -56,6 +56,14 @@ type Client struct {
 	// Fires exactly once per channel per Read failure.
 	OnChannelClosed func(typ Channel, id uint8, err error)
 
+	// MaxSessionBytes caps the total per-channel bytes-read from the
+	// wire; a hostile server otherwise streams millions of 10 MB
+	// frames and outruns GC. 0 means unlimited (the historical
+	// default). Set via atomic.StoreUint64 for runtime tuning.
+	// Typical desktop-viewer sessions fit under a few GiB; set to
+	// 8<<30 (8 GiB) if unsure. Applied per-channel independently.
+	MaxSessionBytes uint64
+
 	// Channel handlers for different SPICE channels
 	main     *ChMain      // Main channel for connection management
 	playback *ChPlayback  // Audio playback channel

@@ -46,6 +46,13 @@ type SpiceConn struct {
 	ackW uint32     // Ack window: send acknowledgment every "window" messages
 	ackP uint32     // Ack position: when it reaches ackW, send ack
 	ackL sync.Mutex // Lock for acknowledgment variables
+
+	// bytesRead is a running total of message-payload bytes consumed
+	// by this channel. Compared against Client.MaxSessionBytes on
+	// every frame — a hostile server sending millions of near-cap
+	// messages otherwise allocates faster than GC can keep up.
+	// Atomic access; 64-bit is intentional (uint32 rolls over at 4 GiB).
+	bytesRead uint64
 }
 
 // ReadLoop continuously reads and processes incoming messages from the SPICE server
@@ -91,6 +98,17 @@ func (c *SpiceConn) ReadLoop() {
 			return
 		}
 	}
+}
+
+// sessionCap returns the per-session read-byte cap, or 0 for
+// unlimited. Reads through to the parent Client if attached so a
+// runtime bump on Client.MaxSessionBytes propagates without needing
+// to restart the connection.
+func (c *SpiceConn) sessionCap() uint64 {
+	if c == nil || c.client == nil {
+		return 0
+	}
+	return atomic.LoadUint64(&c.client.MaxSessionBytes)
 }
 
 // debugLog routes through client.Debug when set, mirroring how
@@ -196,6 +214,20 @@ func (c *SpiceConn) ReadError() error {
 }
 
 func (c *SpiceConn) ReadData(cb func(typ uint16, data []byte) error) error {
+	// checkQuota enforces the per-session read cap (if any). Returns
+	// an error the caller propagates so the readloop terminates
+	// cleanly rather than the goroutine spinning on bad frames.
+	checkQuota := func(size uint32) error {
+		cap := c.sessionCap()
+		if cap == 0 {
+			return nil
+		}
+		total := atomic.AddUint64(&c.bytesRead, uint64(size))
+		if total > cap {
+			return fmt.Errorf("spice: %s session byte cap %d exceeded (%d read)", c.String(), cap, total)
+		}
+		return nil
+	}
 
 	if c.miniHeaders {
 		// only type & size
@@ -212,6 +244,9 @@ func (c *SpiceConn) ReadData(cb func(typ uint16, data []byte) error) error {
 
 		if size > 10*1024*1024 {
 			return errors.New("size too large, limited to 10MB")
+		}
+		if err := checkQuota(size); err != nil {
+			return err
 		}
 
 		buf := make([]byte, size)
@@ -237,6 +272,9 @@ func (c *SpiceConn) ReadData(cb func(typ uint16, data []byte) error) error {
 
 	if size > 10*1024*1024 {
 		return errors.New("size too large, limited to 10MB")
+	}
+	if err := checkQuota(size); err != nil {
+		return err
 	}
 
 	buf := make([]byte, size)

@@ -25,14 +25,32 @@ type FileTransferProgress struct {
 // FileTransferCallback is called when file transfer status changes
 type FileTransferCallback func(progress FileTransferProgress)
 
+// TransferDirection identifies whether an ActiveTransfer is host→guest
+// (upload) or guest→host (download). The wire protocol uses the same
+// message types in both directions; direction is a client-side notion.
+type TransferDirection uint8
+
+const (
+	// TransferUpload is a host-to-guest transfer initiated by
+	// SendFile. File is opened for reading; BytesSent counts bytes
+	// sent to the guest.
+	TransferUpload TransferDirection = 0
+	// TransferDownload is a guest-to-host transfer initiated by
+	// ReceiveFile. File is opened for writing; BytesSent counts
+	// bytes written to disk. Named "BytesSent" for backward compat
+	// with existing callers.
+	TransferDownload TransferDirection = 1
+)
+
 // ActiveTransfer represents an active file transfer
 type ActiveTransfer struct {
 	ID           uint32               // Unique transfer ID
-	File         *os.File             // File handle
+	Dir          TransferDirection    // Upload (host→guest) or Download (guest→host)
+	File         *os.File             // File handle (read for upload, write for download)
 	FileName     string               // File name (used in progress reporting)
 	OriginalPath string               // Original path on the host
-	TotalSize    int64                // Total file size
-	BytesSent    int64                // Bytes sent so far
+	TotalSize    int64                // Total file size — 0 when unknown (download without size hint)
+	BytesSent    int64                // Bytes transferred so far
 	Callback     FileTransferCallback // Progress callback
 }
 
@@ -155,10 +173,105 @@ func (d *SpiceWebdav) handleFileXferStatus(data []byte) {
 	}
 }
 
-// handleFileXferData processes a file transfer data message (for downloads from guest)
+// handleFileXferData processes a file transfer data chunk. Wire
+// format: [uint32 id][uint32 size][size bytes payload]. A payload of
+// size 0 marks end-of-transfer. Previously this method was a stub
+// that silently dropped every guest→host byte. Downloads initiated
+// via ReceiveFile now stream to the on-disk file the caller opened.
 func (d *SpiceWebdav) handleFileXferData(data []byte) {
-	// Not implemented yet - for downloading files from guest
-	log.Printf("spice/webdav: file download not yet implemented")
+	if len(data) < 8 {
+		log.Printf("spice/webdav: dropping short file-xfer data (%d bytes)", len(data))
+		return
+	}
+	id := binary.LittleEndian.Uint32(data[:4])
+	size := binary.LittleEndian.Uint32(data[4:8])
+	// Guard against a hostile agent claiming a payload larger than
+	// what actually arrived — the readloop already caps frames at
+	// 10MB, but the declared size is server-supplied.
+	if uint32(len(data)-8) < size {
+		size = uint32(len(data) - 8)
+	}
+	payload := data[8 : 8+size]
+
+	d.transfersLock.Lock()
+	transfer, ok := d.transfers[id]
+	d.transfersLock.Unlock()
+	if !ok {
+		log.Printf("spice/webdav: dropping data for unknown transfer id=%d", id)
+		return
+	}
+	if transfer.Dir != TransferDownload || transfer.File == nil {
+		log.Printf("spice/webdav: dropping data for non-download transfer id=%d", id)
+		return
+	}
+
+	// Zero-size payload = end of transfer.
+	if size == 0 {
+		if transfer.Callback != nil {
+			transfer.Callback(FileTransferProgress{
+				FileName:   transfer.FileName,
+				TotalSize:  transfer.TotalSize,
+				BytesSent:  transfer.BytesSent,
+				Percentage: 100.0,
+				Status:     VD_AGENT_FILE_XFER_STATUS_SUCCESS,
+			})
+		}
+		d.cleanupTransfer(id)
+		return
+	}
+
+	if _, err := transfer.File.Write(payload); err != nil {
+		log.Printf("spice/webdav: write to download file failed: %v", err)
+		d.sendFileXferStatus(id, VD_AGENT_FILE_XFER_STATUS_ERROR)
+		d.cleanupTransfer(id)
+		return
+	}
+	transfer.BytesSent += int64(len(payload))
+
+	if transfer.Callback != nil {
+		pct := 0.0
+		if transfer.TotalSize > 0 {
+			pct = float64(transfer.BytesSent) * 100.0 / float64(transfer.TotalSize)
+		}
+		transfer.Callback(FileTransferProgress{
+			FileName:   transfer.FileName,
+			TotalSize:  transfer.TotalSize,
+			BytesSent:  transfer.BytesSent,
+			Percentage: pct,
+			Status:     VD_AGENT_FILE_XFER_STATUS_CAN_SEND_DATA,
+		})
+	}
+}
+
+// ReceiveFile opens dstPath for writing and registers a transfer so
+// incoming guest→host FILE_XFER_DATA messages get streamed to disk.
+// The guest side initiates the transfer separately (via its own file-
+// picker UI); this only prepares the receive slot.
+//
+// totalSize can be 0 when the guest hasn't sent a size hint yet; the
+// callback's Percentage stays 0 until the transfer completes.
+func (d *SpiceWebdav) ReceiveFile(id uint32, dstPath string, totalSize int64, cb FileTransferCallback) error {
+	f, err := os.OpenFile(dstPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", dstPath, err)
+	}
+	d.transfersLock.Lock()
+	if _, exists := d.transfers[id]; exists {
+		d.transfersLock.Unlock()
+		_ = f.Close()
+		return fmt.Errorf("transfer id %d already in flight", id)
+	}
+	d.transfers[id] = &ActiveTransfer{
+		ID:           id,
+		Dir:          TransferDownload,
+		File:         f,
+		FileName:     filepath.Base(dstPath),
+		OriginalPath: dstPath,
+		TotalSize:    totalSize,
+		Callback:     cb,
+	}
+	d.transfersLock.Unlock()
+	return nil
 }
 
 // cleanupTransfer removes a transfer from the active transfers map and closes the file
@@ -301,6 +414,7 @@ func (d *SpiceWebdav) SendFile(filePath string, callback FileTransferCallback) (
 	// Create a new transfer
 	transfer := &ActiveTransfer{
 		ID:           id,
+		Dir:          TransferUpload,
 		File:         file,
 		FileName:     fileName,
 		OriginalPath: filePath,
