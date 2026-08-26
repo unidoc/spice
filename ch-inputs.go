@@ -100,8 +100,14 @@ func (input *ChInputs) MousePosition(x, y uint32) {
 	}
 }
 
+// SPICE protocol splits button identifiers in two conventions in the same
+// message: `button` is 1-based (LEFT=1, MIDDLE=2, RIGHT=3, WHEEL_UP=4,
+// WHEEL_DOWN=5), but `buttons_state` is a bitmask where bit N is button
+// N+1 (bit 0=LEFT, bit 1=MIDDLE, bit 2=RIGHT). The original `1 << btn`
+// was off-by-one — for a left click (btn=1) it set the MIDDLE bit, so the
+// guest OS saw "middle button pressed" and ignored real left clicks.
 func (input *ChInputs) MouseDown(btn uint8, x, y uint32) {
-	state := uint16(1) << btn
+	state := uint16(1) << (btn - 1)
 
 	if input.btn&state == state {
 		log.Printf("ignoring btn down %d", btn)
@@ -114,7 +120,7 @@ func (input *ChInputs) MouseDown(btn uint8, x, y uint32) {
 }
 
 func (input *ChInputs) MouseUp(btn uint8, x, y uint32) {
-	state := uint16(1) << btn
+	state := uint16(1) << (btn - 1)
 
 	if input.btn&state == 0 {
 		log.Printf("ignoring btn up %d", btn)
