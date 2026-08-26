@@ -249,11 +249,14 @@ func (c *SpiceConn) ReadData(cb func(typ uint16, data []byte) error) error {
 			return err
 		}
 
-		buf := make([]byte, size)
+		buf, put := getFrameBuf(int(size))
 		if err = c.ReadFull(buf); err != nil {
+			put()
 			return err
 		}
-		return cb(typ, buf)
+		err = cb(typ, buf)
+		put()
+		return err
 	}
 
 	var size, subList uint32
@@ -277,10 +280,17 @@ func (c *SpiceConn) ReadData(cb func(typ uint16, data []byte) error) error {
 		return err
 	}
 
-	buf := make([]byte, size)
+	buf, put := getFrameBuf(int(size))
 	if err := c.ReadFull(buf); err != nil {
+		put()
 		return err
 	}
+	// Ensure the pooled buffer goes back regardless of which branch
+	// below returns. Every handler is expected to process the buffer
+	// synchronously — anything retaining bytes past `cb` return
+	// (currently only ch-main.go's agent-partial-frame buffer) makes
+	// its own copy before we return here.
+	defer put()
 
 	if subList == 0 {
 		// simple
@@ -542,4 +552,60 @@ func (c *SpiceConn) readSpiceLinkReply() error {
 
 func (c *SpiceConn) Close() error {
 	return c.conn.Close()
+}
+
+// --- Frame buffer pool -------------------------------------------------
+//
+// Historically ReadData did `make([]byte, size)` on every incoming
+// frame. On a busy display channel that meant a fresh allocation per
+// ~16 ms of wall clock, all going straight to GC — the noticeable
+// scroll-hiccup pattern operators saw over VPN. The pool below groups
+// buffers into a small set of size classes, backed by sync.Pool. Every
+// frame ≤ the class cap gets a reused buffer; anything larger falls
+// through to a plain make. The `put` closure returned to the caller
+// puts the buffer back once processing is done.
+//
+// Handler contract: process the buffer synchronously. If a handler
+// needs to retain bytes past the callback return, it MUST make its
+// own copy — the underlying slice will be handed to the next reader
+// as soon as `put` fires.
+
+var frameBufSizes = [...]int{
+	4 * 1024,         // ACK / small control messages
+	64 * 1024,        // typical draw commands
+	512 * 1024,       // moderate compressed images
+	2 * 1024 * 1024,  // large jpeg / lz frames
+	10 * 1024 * 1024, // per-frame cap (max we ever accept)
+}
+
+var frameBufPools = func() [len(frameBufSizes)]sync.Pool {
+	var pools [len(frameBufSizes)]sync.Pool
+	for i, sz := range frameBufSizes {
+		sz := sz
+		pools[i].New = func() interface{} {
+			b := make([]byte, sz)
+			return &b
+		}
+	}
+	return pools
+}()
+
+// getFrameBuf returns a slice of length exactly `size` backed by a
+// pooled buffer from the smallest sufficient size class, plus a `put`
+// closure the caller must invoke when finished (safe to call once).
+// If size exceeds the largest class we fall back to a plain make so
+// pathological frames don't wedge the pool.
+func getFrameBuf(size int) (buf []byte, put func()) {
+	for i, cap := range frameBufSizes {
+		if size <= cap {
+			ptr := frameBufPools[i].Get().(*[]byte)
+			b := (*ptr)[:size]
+			return b, func() {
+				*ptr = (*ptr)[:cap]
+				frameBufPools[i].Put(ptr)
+			}
+		}
+	}
+	// Larger than any class — one-shot allocation, no pooling.
+	return make([]byte, size), func() {}
 }

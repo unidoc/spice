@@ -585,7 +585,11 @@ func (m *ChMain) agentHandler(data []byte) {
 	}
 	if len(data) < int(size) {
 		log.Printf("spice/main: waiting for more data from agent...")
-		m.vdb = data
+		// Copy: the underlying slice is a pooled frame buffer that
+		// the readloop reuses on the next iteration. Retaining it
+		// verbatim would race with the next Read; the ~4-8 KB copy
+		// is negligible compared to the multi-MB image frames.
+		m.vdb = append([]byte(nil), data...)
 		return
 	}
 

@@ -3,6 +3,8 @@ package spice
 import (
 	"encoding/binary"
 	"log"
+	"sync"
+	"time"
 )
 
 const (
@@ -34,7 +36,28 @@ type ChInputs struct {
 
 	// btn state
 	btn uint16
+
+	// Mouse-position coalescing. Fyne (and most GUI toolkits) fire
+	// 60-90 MouseMoved events per second while the pointer is
+	// moving; each turns into a MOUSE_POSITION WriteMessage over the
+	// wire. Over VPN that's serialised latency plus wasted bandwidth
+	// for intermediate positions the guest never renders. Coalesce
+	// into ~60 fps peak: send the first event immediately, then hold
+	// subsequent ones in `mousePending` until a single timer flushes
+	// the latest position.
+	mouseLk      sync.Mutex
+	mouseLast    time.Time
+	mouseTimer   *time.Timer
+	mousePending struct {
+		x, y  uint32
+		valid bool
+	}
 }
+
+// mouseMinInterval bounds outbound MOUSE_POSITION messages. 16 ms ≈ 60
+// fps, which matches typical guest OS pointer rendering. Lower than
+// this only adds VPN chatter without visible improvement.
+const mouseMinInterval = 16 * time.Millisecond
 
 func (cl *Client) setupInputs(id uint8) (*ChInputs, error) {
 	conn, err := cl.conn(ChannelInputs, id, nil) //caps(SPICE_INPUTS_CAP_KEY_SCANCODE))
@@ -104,8 +127,48 @@ func (input *ChInputs) OnKeyUp(k []byte) {
 }
 
 func (input *ChInputs) MousePosition(x, y uint32) {
-	var displayID uint8
+	input.mouseLk.Lock()
+	now := time.Now()
+	if now.Sub(input.mouseLast) >= mouseMinInterval {
+		// Cold path — enough time has elapsed, send now.
+		input.mouseLast = now
+		input.mousePending.valid = false
+		input.mouseLk.Unlock()
+		input.sendMousePosition(x, y)
+		return
+	}
+	// Hot path — coalesce. Overwrite any pending position; the guest
+	// only cares about the final one.
+	input.mousePending.x = x
+	input.mousePending.y = y
+	input.mousePending.valid = true
+	if input.mouseTimer == nil {
+		delay := mouseMinInterval - now.Sub(input.mouseLast)
+		input.mouseTimer = time.AfterFunc(delay, input.flushMousePosition)
+	}
+	input.mouseLk.Unlock()
+}
 
+// flushMousePosition is invoked by the coalescing timer to send the
+// most recent buffered position. Runs on its own goroutine (the
+// AfterFunc callback runs in a fresh goroutine, per time.AfterFunc
+// semantics) so we take the lock and read pending state safely.
+func (input *ChInputs) flushMousePosition() {
+	input.mouseLk.Lock()
+	input.mouseTimer = nil
+	if !input.mousePending.valid {
+		input.mouseLk.Unlock()
+		return
+	}
+	x, y := input.mousePending.x, input.mousePending.y
+	input.mousePending.valid = false
+	input.mouseLast = time.Now()
+	input.mouseLk.Unlock()
+	input.sendMousePosition(x, y)
+}
+
+func (input *ChInputs) sendMousePosition(x, y uint32) {
+	var displayID uint8
 	err := input.conn.WriteMessage(SPICE_MSGC_INPUTS_MOUSE_POSITION, x, y, input.btn, displayID)
 	if err != nil {
 		log.Printf("Failed to send mouse position: %s", err)
