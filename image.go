@@ -10,7 +10,7 @@ import (
 	"image/jpeg"
 	"io"
 
-	"github.com/Shells-com/spice/quic"
+	"github.com/unidoc/spice/quic"
 )
 
 type Image struct {

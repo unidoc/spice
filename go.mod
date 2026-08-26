@@ -1,4 +1,4 @@
-module github.com/Shells-com/spice
+module github.com/unidoc/spice
 
 go 1.23
 

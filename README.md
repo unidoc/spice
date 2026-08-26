@@ -1,4 +1,4 @@
-[![GoDoc](https://godoc.org/github.com/Shells-com/spice?status.svg)](https://godoc.org/github.com/Shells-com/spice)
+[![GoDoc](https://godoc.org/github.com/unidoc/spice?status.svg)](https://godoc.org/github.com/unidoc/spice)
 
 # Spice
 
@@ -67,7 +67,7 @@ package main
 import (
     "fmt"
     "net"
-    "github.com/Shells-com/spice"
+    "github.com/unidoc/spice"
 )
 
 // SimpleConnector implements spice.Connector for direct TCP connections
@@ -183,7 +183,7 @@ package main
 
 import (
     "image"
-    "github.com/Shells-com/spice"
+    "github.com/unidoc/spice"
 )
 
 type MinimalDriver struct {

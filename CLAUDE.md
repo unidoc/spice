@@ -4,8 +4,8 @@
 - Build: `make` or `make all` (runs goimports and builds)
 - Install deps: `make deps`
 - Run all tests: `make test` or `go test -v ./...`
-- Test single package: `go test -v github.com/Shells-com/spice/quic`
-- Test single test: `go test -v github.com/Shells-com/spice/quic -run TestQuic`
+- Test single package: `go test -v github.com/unidoc/spice/quic`
+- Test single test: `go test -v github.com/unidoc/spice/quic -run TestQuic`
 - Format code: `$(GOPATH)/bin/goimports -w -l .`
 
 ## Code Style Guidelines
